@@ -1,0 +1,85 @@
+name: wagering-processor
+
+# Usage:
+#   Infra only (run the app locally with `bun run dev`):
+#     docker compose up -d
+#   Infra + 3 app instances (README §8 / §13 — multi-instance correctness):
+#     docker compose --profile app up -d --build --scale app=3
+
+x-app-env: &app-env
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_USER: ${DB_USER:-wagering}
+  DB_PASSWORD: ${DB_PASSWORD:-wagering}
+  DB_NAME: ${DB_NAME:-wagering}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+  AWS_ENDPOINT_URL: http://sqs:4566
+  SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-wager-transactions.fifo}
+  SQS_DLQ_NAME: ${SQS_DLQ_NAME:-wager-transactions-dlq.fifo}
+  SQS_OUTBOX_QUEUE_NAME: ${SQS_OUTBOX_QUEUE_NAME:-wager-events.fifo}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-wagering}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-wagering}
+      POSTGRES_DB: ${DB_NAME:-wagering}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # SQS emulator. MiniStack is used instead of LocalStack because the LocalStack
+  # image now requires an account auth token even on the free tier; MiniStack
+  # is explicitly accepted by the challenge (README §4) and needs no sign-up.
+  sqs:
+    image: ministackorg/ministack:${MINISTACK_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${SQS_PORT:-4566}:4566"
+
+  # One-shot job: creates the FIFO queue + DLQ with redrive policy, then exits.
+  sqs-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      sqs:
+        condition: service_started
+    entrypoint: ["/bin/sh", "/scripts/sqs-init.sh"]
+    environment:
+      <<: *app-env
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+      SQS_VISIBILITY_TIMEOUT_SECONDS: ${SQS_VISIBILITY_TIMEOUT_SECONDS:-30}
+    volumes:
+      - ./docker/sqs-init.sh:/scripts/sqs-init.sh:ro
+    restart: "no"
+
+  app:
+    profiles: ["app"]
+    build: .
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      NODE_ENV: production
+      PORT: 3000
+    # Host port range so `--scale app=3` works: instances get 3000, 3001, 3002.
+    ports:
+      - "${APP_PORT_RANGE:-3000-3002}:3000"
+    stop_grace_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sqs-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:

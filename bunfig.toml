@@ -1,0 +1,3 @@
+[test]
+# NestJS depends on the Reflect metadata polyfill being loaded before any decorated class.
+preload = ["./test/setup.ts"]
